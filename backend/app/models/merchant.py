@@ -2,7 +2,7 @@
 import uuid
 from datetime import datetime
 from sqlalchemy import Column, String, Boolean, DateTime, Text, ForeignKey, Index
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Uuid as UUID  # native UUID on PostgreSQL, CHAR(32) elsewhere (tests)
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 

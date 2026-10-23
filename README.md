@@ -131,6 +131,19 @@ http://localhost:8000/docs
 http://localhost:3000
 ```
 
+### Configuration
+
+Copy `.env.example` to `.env` and set real secrets. With `ENVIRONMENT=production` the API refuses to start on the default `SECRET_KEY` / `WEBHOOK_SECRET`, and the sandbox checkout and callback endpoints are disabled.
+
+### Running the tests
+
+```bash
+cd backend
+pip install -r requirements-dev.txt
+pytest                      # SQLite, no services needed
+TEST_DATABASE_URL=postgresql+asyncpg://user:pass@localhost/gateway_test pytest   # same suite on PostgreSQL
+```
+
 ### Services
 
 | Service    |   Port | Description                     |
@@ -327,6 +340,19 @@ POST /v1/payments/{payment_id}/refund?amount=5000
 
 ## Merchant API
 
+### Other endpoints
+
+```http
+GET    /v1/auth/me                      # login JWT
+GET    /v1/auth/api-keys                # list keys (login JWT)
+DELETE /v1/auth/api-keys/{id}           # revoke a key (login JWT)
+GET    /v1/payments/{id}/ledger         # ledger entries for a payment
+DELETE /v1/webhooks/{id}                # deactivate an endpoint
+GET    /health
+```
+
+API keys are accepted as `Authorization: Bearer pk_...` or `X-API-Key`. Keys are shown once at creation and stored hashed. Creating and revoking keys requires a login JWT, not an API key.
+
 ### Get Merchant Profile
 
 ```http
@@ -384,6 +410,8 @@ GET /v1/webhooks
   "created_at": "2026-08-26T12:00:00Z"
 }
 ```
+
+Supported events: `payment.created`, `payment.authorized`, `payment.captured`, `payment.settled`, `payment.failed`, `payment.cancelled`, `payment.refunded`, or `*`. Failed deliveries are retried with exponential backoff (5 attempts). The signing secret is returned once when the endpoint is created.
 
 ### Signature
 

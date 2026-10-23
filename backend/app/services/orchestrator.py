@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.payment import Payment, PaymentStatus, PaymentMethod
 from app.services.payment_engine import PaymentEngine
 from app.services.ledger import LedgerService
+from app.services.fraud import FraudEngine
 from app.core.config import get_settings
 
 settings = get_settings()
@@ -93,6 +94,10 @@ class MockPayByBankProvider:
         return ProviderResult(success=False, error_message="Bank transfer declined")
 
 
+class IdempotencyConflict(ValueError):
+    """Same Idempotency-Key reused with different request parameters."""
+
+
 class PaymentOrchestrator:
     """Routes payments to appropriate providers."""
 
@@ -105,6 +110,7 @@ class PaymentOrchestrator:
     def __init__(self):
         self.engine = PaymentEngine()
         self.ledger = LedgerService()
+        self.fraud = FraudEngine()
 
     async def create_and_route_payment(
         self,
@@ -122,10 +128,25 @@ class PaymentOrchestrator:
         idempotency_key: Optional[str],
         metadata: Optional[dict],
     ) -> dict:
-        """Create payment and route to best available provider."""
+        """Create payment and route to best available provider.
+
+        The result dict always has "payment" and "created" (False when an
+        idempotent replay returned an existing payment). On failure it also
+        has "error".
+        """
 
         # Select primary method (first available)
         primary_method = methods[0] if methods else PaymentMethod.CARD
+
+        # Idempotent replay: return the original payment without re-routing
+        if idempotency_key:
+            existing = await self.engine.find_by_idempotency_key(db, merchant_id, idempotency_key)
+            if existing:
+                if existing.amount_cents != amount_cents or existing.currency != currency:
+                    raise IdempotencyConflict(
+                        "Idempotency-Key was already used with different request parameters"
+                    )
+                return self._result_for_existing(existing)
 
         # Create payment
         payment = await self.engine.create_payment(
@@ -144,6 +165,15 @@ class PaymentOrchestrator:
             metadata=metadata,
         )
 
+        # Risk evaluation before any money-moving step
+        risk = await self.fraud.evaluate(db, payment)
+        payment.risk_score = risk["score"]
+        payment.risk_flags = risk["flags"]
+        if risk["blocked"]:
+            await self.engine.transition_status(db, payment, PaymentStatus.FAILED)
+            await db.flush()
+            return {"payment": payment, "created": True, "error": "Payment blocked by risk engine"}
+
         # Route to provider
         provider = self.PROVIDERS.get(primary_method, MockCardProvider())
         payment.provider = provider.name
@@ -154,27 +184,30 @@ class PaymentOrchestrator:
             await self.engine.transition_status(
                 db, payment, PaymentStatus.PENDING, result.provider_reference
             )
-
-            # Build checkout URL
-            checkout_url = f"http://localhost:8000/v1/payments/{payment.id}/checkout"
-            payment.checkout_url = checkout_url
-
+            payment.checkout_url = f"{settings.PUBLIC_BASE_URL}/v1/payments/{payment.id}/checkout"
             await db.flush()
 
             return {
                 "payment": payment,
-                "checkout_url": checkout_url,
+                "created": True,
+                "checkout_url": payment.checkout_url,
                 "provider": provider.name,
                 "requires_redirect": result.requires_redirect,
             }
-        else:
-            await self.engine.transition_status(db, payment, PaymentStatus.FAILED)
-            await db.flush()
 
-            return {
-                "payment": payment,
-                "error": result.error_message,
-            }
+        await self.engine.transition_status(db, payment, PaymentStatus.FAILED, result.provider_reference)
+        await db.flush()
+        return {"payment": payment, "created": True, "error": result.error_message}
+
+    @staticmethod
+    def _result_for_existing(payment: Payment) -> dict:
+        out = {"payment": payment, "created": False, "provider": payment.provider}
+        if payment.checkout_url:
+            out["checkout_url"] = payment.checkout_url
+            out["requires_redirect"] = payment.status == PaymentStatus.PENDING.value
+        if payment.status == PaymentStatus.FAILED.value:
+            out["error"] = "Payment failed"
+        return out
 
     async def process_callback(
         self,
@@ -183,29 +216,40 @@ class PaymentOrchestrator:
         success: bool,
         provider_reference: Optional[str] = None
     ) -> Payment:
-        """Process provider callback and update payment state."""
+        """Process provider callback and update payment state.
 
-        if payment.status in [PaymentStatus.CAPTURED.value, PaymentStatus.SETTLED.value]:
-            return payment  # Already processed
+        Replays of a callback that matches the payment's current outcome are
+        no-ops. A callback that contradicts a final state raises ValueError.
+        """
+        done = (PaymentStatus.CAPTURED.value, PaymentStatus.SETTLED.value,
+                PaymentStatus.REFUNDED.value, PaymentStatus.PARTIALLY_REFUNDED.value,
+                PaymentStatus.REFUND_PENDING.value)
+        if payment.status in done:
+            if success:
+                return payment  # already processed
+            raise ValueError(f"Payment is already {payment.status}")
+        if payment.status == PaymentStatus.FAILED.value and not success:
+            return payment
 
         if success:
-            # Transition to captured
-            payment, _ = await self.engine.transition_status(
-                db, payment, PaymentStatus.CAPTURED, provider_reference
-            )
-
-            # Record in ledger
+            if payment.status != PaymentStatus.PENDING.value:
+                raise ValueError(f"Cannot capture a payment in state {payment.status}")
+            # PENDING -> AUTHORIZED -> CAPTURED -> SETTLED (auto-settle for MVP)
+            await self.engine.transition_status(db, payment, PaymentStatus.AUTHORIZED, provider_reference)
+            await self.engine.transition_status(db, payment, PaymentStatus.CAPTURED)
             await self.ledger.record_payment_captured(db, payment, payment.fee_cents)
-
-            # Auto-settle for MVP
-            payment, _ = await self.engine.transition_status(
-                db, payment, PaymentStatus.SETTLED
-            )
+            await self.engine.transition_status(db, payment, PaymentStatus.SETTLED)
         else:
-            payment, _ = await self.engine.transition_status(
-                db, payment, PaymentStatus.FAILED
-            )
+            await self.engine.transition_status(db, payment, PaymentStatus.FAILED)
 
+        await db.flush()
+        return payment
+
+    async def cancel_payment(self, db: AsyncSession, payment: Payment) -> Payment:
+        """Customer cancelled at checkout."""
+        if payment.status == PaymentStatus.CANCELLED.value:
+            return payment
+        await self.engine.transition_status(db, payment, PaymentStatus.CANCELLED)
         await db.flush()
         return payment
 
@@ -215,27 +259,30 @@ class PaymentOrchestrator:
         payment: Payment,
         refund_amount_cents: Optional[int] = None
     ) -> Payment:
-        """Process refund for a settled payment."""
+        """Process a full or partial refund for a settled payment."""
 
-        if payment.status != PaymentStatus.SETTLED.value:
+        if payment.status not in (PaymentStatus.SETTLED.value, PaymentStatus.PARTIALLY_REFUNDED.value):
             raise ValueError("Can only refund settled payments")
 
-        refund_amount = refund_amount_cents or payment.amount_cents
+        remaining = payment.amount_cents - payment.refunded_amount_cents
+        refund_amount = remaining if refund_amount_cents is None else refund_amount_cents
 
-        if refund_amount > (payment.amount_cents - payment.refunded_amount_cents):
+        if refund_amount <= 0:
+            raise ValueError("Refund amount must be positive")
+        if refund_amount > remaining:
             raise ValueError("Refund amount exceeds available balance")
 
-        # Update payment
+        merchant_balance = await self.ledger.get_merchant_balance(db, payment.merchant_id)
+        if refund_amount > merchant_balance:
+            raise ValueError("Insufficient merchant balance to fund this refund")
+
         payment.refunded_amount_cents += refund_amount
-
-        if payment.refunded_amount_cents >= payment.amount_cents:
-            new_status = PaymentStatus.REFUNDED
-        else:
-            new_status = PaymentStatus.PARTIALLY_REFUNDED
-
-        payment, _ = await self.engine.transition_status(db, payment, new_status)
-
-        # Record in ledger
+        new_status = (
+            PaymentStatus.REFUNDED
+            if payment.refunded_amount_cents >= payment.amount_cents
+            else PaymentStatus.PARTIALLY_REFUNDED
+        )
+        await self.engine.transition_status(db, payment, new_status)
         await self.ledger.record_payment_refunded(db, payment, refund_amount)
 
         await db.flush()

@@ -31,9 +31,19 @@ def decode_token(token: str) -> Optional[dict]:
         return None
 
 
-def generate_api_key() -> str:
+def generate_api_key(environment: Optional[str] = None) -> str:
     import secrets
-    return "pk_live_" + secrets.token_urlsafe(32) if settings.ENVIRONMENT == "production" else "pk_test_" + secrets.token_urlsafe(32)
+    env = environment or ("live" if settings.ENVIRONMENT == "production" else "test")
+    return f"pk_{env}_" + secrets.token_urlsafe(32)
+
+
+def hash_api_key(key: str) -> str:
+    """API keys are high-entropy random strings, so a fast SHA-256 is sufficient."""
+    import hashlib
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+API_KEY_PREFIX_LEN = 16
 
 
 def generate_secret_key() -> str:

@@ -37,7 +37,7 @@ class LedgerService:
         ]
 
         for name, acc_type in account_configs:
-            result = await db.execute(select(Account).where(Account.name == name, Account.is_system == "t"))
+            result = await db.execute(select(Account).where(Account.name == name, Account.is_system == "t").with_for_update())
             account = result.scalar_one_or_none()
 
             if not account:
@@ -60,7 +60,7 @@ class LedgerService:
             select(Account).where(
                 Account.merchant_id == merchant_id,
                 Account.account_type == AccountType.LIABILITY
-            )
+            ).with_for_update()
         )
         account = result.scalar_one_or_none()
 
