@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from enum import Enum as PyEnum
 from sqlalchemy import Column, String, Integer, BigInteger, DateTime, Text, ForeignKey, Index, JSON
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Uuid as UUID  # native UUID on PostgreSQL, CHAR(32) elsewhere (tests)
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
@@ -78,7 +78,7 @@ class Payment(Base):
     checkout_url = Column(Text, nullable=True)
 
     # Metadata
-    metadata = Column(JSON, default=dict)
+    metadata_ = Column("metadata", JSON, default=dict)
 
     # Risk
     risk_score = Column(Integer, nullable=True)
@@ -99,7 +99,7 @@ class Payment(Base):
     __table_args__ = (
         Index("idx_payments_merchant_status", "merchant_id", "status"),
         Index("idx_payments_merchant_reference", "merchant_id", "merchant_reference"),
-        Index("idx_payments_idempotency", "merchant_id", "idempotency_key"),
+        Index("idx_payments_idempotency", "merchant_id", "idempotency_key", unique=True),
     )
 
     def can_transition_to(self, new_status: PaymentStatus) -> bool:

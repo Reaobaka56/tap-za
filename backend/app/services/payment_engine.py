@@ -1,5 +1,6 @@
 """Payment engine - state machine, idempotency, fee calculation."""
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,9 +18,20 @@ class PaymentEngine:
     @staticmethod
     def calculate_fees(amount_cents: int) -> tuple[int, int]:
         """Calculate gateway fees. Returns (fee_cents, net_cents)."""
-        fee = int(amount_cents * settings.GATEWAY_FEE_PERCENT / 100) + settings.GATEWAY_FEE_FIXED_CENTS
+        percent_fee = (Decimal(amount_cents) * Decimal(str(settings.GATEWAY_FEE_PERCENT)) / 100)
+        fee = int(percent_fee.quantize(Decimal(1), rounding=ROUND_HALF_UP)) + settings.GATEWAY_FEE_FIXED_CENTS
         net = amount_cents - fee
         return fee, net
+
+    async def find_by_idempotency_key(
+        self, db: AsyncSession, merchant_id: UUID, idempotency_key: str
+    ) -> Optional[Payment]:
+        result = await db.execute(
+            select(Payment).where(
+                and_(Payment.merchant_id == merchant_id, Payment.idempotency_key == idempotency_key)
+            )
+        )
+        return result.scalar_one_or_none()
 
     async def create_payment(
         self,
@@ -69,7 +81,7 @@ class PaymentEngine:
             cancel_url=cancel_url,
             description=description,
             idempotency_key=idempotency_key,
-            metadata=metadata or {},
+            metadata_=metadata or {},
             status=PaymentStatus.CREATED.value,
         )
 
@@ -83,8 +95,8 @@ class PaymentEngine:
         payment: Payment,
         new_status: PaymentStatus,
         provider_reference: Optional[str] = None,
-    ) -> Payment:
-        """Transition payment to new state with validation."""
+    ) -> tuple[Payment, str]:
+        """Transition payment to new state with validation. Returns (payment, old_status)."""
 
         if not payment.can_transition_to(new_status):
             raise ValueError(
@@ -115,12 +127,15 @@ class PaymentEngine:
         self,
         db: AsyncSession,
         payment_id: UUID,
-        merchant_id: Optional[UUID] = None
+        merchant_id: Optional[UUID] = None,
+        for_update: bool = False,
     ) -> Optional[Payment]:
-        """Get payment by ID, optionally scoped to merchant."""
+        """Get payment by ID, optionally scoped to merchant. for_update row-locks it."""
         query = select(Payment).where(Payment.id == payment_id)
         if merchant_id:
             query = query.where(Payment.merchant_id == merchant_id)
+        if for_update:
+            query = query.with_for_update()
 
         result = await db.execute(query)
         return result.scalar_one_or_none()

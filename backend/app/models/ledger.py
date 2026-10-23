@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from enum import Enum as PyEnum
 from sqlalchemy import Column, String, BigInteger, DateTime, Text, ForeignKey, Index, Enum
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Uuid as UUID  # native UUID on PostgreSQL, CHAR(32) elsewhere (tests)
 from sqlalchemy.orm import relationship, validates
 from app.core.database import Base
 

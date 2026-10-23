@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tap ZA - Merchant Dashboard</title>
+<style>
+:root{--bg:#0b0b0c;--panel:#161618;--line:#2a2a2e;--fg:#f2f2f2;--mut:#9a9aa2;--ok:#4ade80;--warn:#d6a84a;--bad:#f87171}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,sans-serif}
+header{display:flex;justify-content:space-between;align-items:center;padding:16px 28px;border-bottom:1px solid var(--line)}
+header b{font-size:16px}main{max-width:1000px;margin:0 auto;padding:28px;display:grid;gap:22px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px}
+h2{font-size:13px;font-weight:600;color:var(--mut);text-transform:uppercase;letter-spacing:.06em;margin:0 0 14px}
+.bal{font-size:36px;font-weight:650}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+input,select{background:#0f0f10;border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:9px 11px;font:inherit}
+button{background:var(--fg);color:var(--bg);border:0;border-radius:8px;padding:9px 14px;font:inherit;font-weight:600;cursor:pointer}
+button.ghost{background:transparent;color:var(--mut);border:1px solid var(--line)}button.sm{padding:4px 10px;font-size:12px}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line)}th{color:var(--mut);font-weight:500;font-size:12px}
+.badge{font-size:11px;padding:2px 8px;border-radius:99px;border:1px solid var(--line)}
+.settled,.captured{color:var(--ok)}.pending,.partially_refunded{color:var(--warn)}.failed,.cancelled,.refunded{color:var(--bad)}
+.note{color:var(--warn);font-size:13px;margin-top:10px;word-break:break-all}.err{color:var(--bad);margin-top:8px}code{font-family:ui-monospace,monospace}
+#auth{max-width:380px;margin:80px auto;display:grid;gap:10px}.hidden{display:none!important}.mut{color:var(--mut)}
+</style>
+</head>
+<body>
+<div id="auth" class="card hidden">
+  <b style="font-size:18px">Tap ZA</b><span class="mut">Merchant dashboard (sandbox)</span>
+  <input id="email" type="email" placeholder="Email" autocomplete="username">
+  <input id="password" type="password" placeholder="Password (min 8 characters)" autocomplete="current-password">
+  <input id="business" placeholder="Business name (register only)">
+  <div class="row"><button id="login">Log in</button><button id="register" class="ghost">Register</button></div>
+  <div id="autherr" class="err"></div>
+</div>
+
+<div id="app" class="hidden">
+<header><b>Tap ZA <span class="mut" style="font-weight:400">sandbox</span></b><div class="row"><span id="who" class="mut"></span><button id="logout" class="ghost sm">Log out</button></div></header>
+<main>
+  <section class="card"><h2>Balance</h2><div class="bal" id="balance">-</div></section>
+
+  <section class="card"><h2>New test payment</h2>
+    <div class="row">
+      <input id="amt" type="number" min="5" step="0.01" value="199.00" style="width:120px"> <span class="mut">ZAR</span>
+      <select id="method"><option value="card">Card</option><option value="eft">EFT</option><option value="pay_by_bank">Pay by bank</option></select>
+      <input id="desc" placeholder="Description" style="flex:1;min-width:160px">
+      <button id="pay">Create &amp; open checkout</button>
+    </div><div id="payerr" class="err"></div>
+  </section>
+
+  <section class="card"><h2>Payments</h2>
+    <table><thead><tr><th>Created</th><th>Reference</th><th>Method</th><th>Amount</th><th>Fee</th><th>Status</th><th></th></tr></thead><tbody id="payments"></tbody></table>
+    <div id="empty" class="mut hidden">No payments yet.</div>
+  </section>
+
+  <section class="card"><h2>API keys</h2>
+    <div class="row"><input id="keyname" placeholder="Key name" value="Sandbox"><button id="mkkey">Create key</button></div>
+    <div id="newkey" class="note"></div>
+    <table><tbody id="keys"></tbody></table>
+  </section>
+
+  <section class="card"><h2>Webhooks</h2>
+    <div class="row"><input id="whurl" placeholder="https://merchant.co.za/webhooks" style="flex:1;min-width:220px"><button id="mkwh">Add endpoint</button></div>
+    <div id="newwh" class="note"></div><div id="wherr" class="err"></div>
+    <table><tbody id="whs"></tbody></table>
+  </section>
+</main></div>
+
+<script>
+const API = window.API_BASE || 'http://localhost:8000';
+const $ = id => document.getElementById(id);
+let jwt = sessionStorage.getItem('jwt');
+const rands = c => 'R ' + (c / 100).toLocaleString('en-ZA', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+
+async function api(path, opts = {}) {
+  const r = await fetch(API + path, {...opts, headers: {'Content-Type': 'application/json', Authorization: 'Bearer ' + jwt, ...(opts.headers || {})}});
+  if (r.status === 401) { logout(); throw new Error('Session expired'); }
+  if (r.status === 204) return null;
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok && r.status !== 402) throw new Error(typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail || body));
+  return body;
+}
+function el(tag, props = {}, ...kids) {           // all rendering goes through textContent: no HTML injection
+  const e = document.createElement(tag);
+  Object.assign(e, props);
+  kids.forEach(k => e.append(k));
+  return e;
+}
+function cell(...kids) { return el('td', {}, ...kids); }
+
+async function auth(path, extra = {}) {
+  $('autherr').textContent = '';
+  try {
+    const r = await fetch(API + path, {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email: $('email').value, password: $('password').value, ...extra})});
+    const body = await r.json();
+    if (!r.ok) throw new Error(typeof body.detail === 'string' ? body.detail : 'Check your details and try again');
+    jwt = body.access_token; sessionStorage.setItem('jwt', jwt); start();
+  } catch (e) { $('autherr').textContent = e.message; }
+}
+$('login').onclick = () => auth('/v1/auth/login');
+$('register').onclick = () => auth('/v1/auth/register', {business_name: $('business').value || 'My Business'});
+function logout() { jwt = null; sessionStorage.removeItem('jwt'); $('app').classList.add('hidden'); $('auth').classList.remove('hidden'); }
+$('logout').onclick = logout;
+
+async function start() {
+  $('auth').classList.add('hidden'); $('app').classList.remove('hidden');
+  try {
+    const me = await api('/v1/auth/me'); $('who').textContent = me.business_name + ' - ' + me.email;
+    await Promise.all([loadBalance(), loadPayments(), loadKeys(), loadWebhooks()]);
+  } catch (e) { /* api() already handled expiry */ }
+}
+async function loadBalance() { $('balance').textContent = rands((await api('/v1/merchant/balance')).balance_cents); }
+
+async function loadPayments() {
+  const rows = await api('/v1/payments?limit=50'); const tb = $('payments'); tb.replaceChildren();
+  $('empty').classList.toggle('hidden', rows.length > 0);
+  for (const p of rows) {
+    const act = cell();
+    if (p.status === 'pending' && p.checkout_url) act.append(el('button', {className: 'ghost sm', textContent: 'Checkout', onclick: () => window.open(p.checkout_url, '_blank', 'noopener')}));
+    if (p.status === 'settled' || p.status === 'partially_refunded') act.append(el('button', {className: 'ghost sm', textContent: 'Refund', onclick: () => refund(p)}));
+    tb.append(el('tr', {}, cell(new Date(p.created_at + 'Z').toLocaleString()), cell(p.merchant_reference || p.id.slice(0, 8)),
+      cell(p.payment_method || '-'), cell(rands(p.amount_cents)), cell(rands(p.fee_cents)),
+      cell(el('span', {className: 'badge ' + p.status, textContent: p.status})), act));
+  }
+}
+async function refund(p) {
+  const left = p.amount_cents - p.refunded_amount_cents;
+  const v = prompt('Refund amount in rands (max ' + (left / 100).toFixed(2) + ')', (left / 100).toFixed(2));
+  if (!v) return;
+  try { await api('/v1/payments/' + p.id + '/refund?amount=' + Math.round(parseFloat(v) * 100), {method: 'POST'}); await Promise.all([loadPayments(), loadBalance()]); }
+  catch (e) { alert(e.message); }
+}
+$('pay').onclick = async () => {
+  $('payerr').textContent = '';
+  try {
+    const p = await api('/v1/payments', {method: 'POST', body: JSON.stringify({amount: Math.round(parseFloat($('amt').value) * 100), currency: 'ZAR',
+      methods: [$('method').value], description: $('desc').value || null, merchant_reference: 'DASH-' + Date.now()})});
+    if (p.checkout_url && p.status === 'pending') window.open(p.checkout_url, '_blank', 'noopener');
+    else $('payerr').textContent = p.error || 'Payment could not be started';
+    loadPayments();
+  } catch (e) { $('payerr').textContent = e.message; }
+};
+setInterval(() => { if (jwt && !document.hidden) { loadPayments().catch(() => {}); loadBalance().catch(() => {}); } }, 5000);
+
+async function loadKeys() {
+  const rows = await api('/v1/auth/api-keys'); const tb = $('keys'); tb.replaceChildren();
+  for (const k of rows) tb.append(el('tr', {}, cell(k.name), cell(el('code', {textContent: k.key_prefix + '...'})), cell(k.environment),
+    cell(k.revoked_at ? 'revoked' : el('button', {className: 'ghost sm', textContent: 'Revoke', onclick: async () => { await api('/v1/auth/api-keys/' + k.id, {method: 'DELETE'}); loadKeys(); }}))));
+}
+$('mkkey').onclick = async () => {
+  const k = await api('/v1/auth/api-keys?name=' + encodeURIComponent($('keyname').value || 'Key') + '&environment=test', {method: 'POST'});
+  $('newkey').textContent = 'Copy this key now, it will not be shown again: ' + k.key; loadKeys();
+};
+
+async function loadWebhooks() {
+  const rows = await api('/v1/webhooks'); const tb = $('whs'); tb.replaceChildren();
+  for (const w of rows.filter(w => w.is_active)) tb.append(el('tr', {}, cell(w.url), cell((w.events || []).join(', ')),
+    cell(el('button', {className: 'ghost sm', textContent: 'Remove', onclick: async () => { await api('/v1/webhooks/' + w.id, {method: 'DELETE'}); loadWebhooks(); }}))));
+}
+$('mkwh').onclick = async () => {
+  $('wherr').textContent = ''; $('newwh').textContent = '';
+  try { const w = await api('/v1/webhooks', {method: 'POST', body: JSON.stringify({url: $('whurl').value, events: ['*']})});
+    $('newwh').textContent = 'Signing secret (shown once): ' + w.secret; $('whurl').value = ''; loadWebhooks(); }
+  catch (e) { $('wherr').textContent = e.message; }
+};
+
+if (jwt) start(); else $('auth').classList.remove('hidden');
+</script>
+</body>
+</html>

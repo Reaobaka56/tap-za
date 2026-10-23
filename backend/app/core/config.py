@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     GATEWAY_FEE_PERCENT: float = 2.5
     GATEWAY_FEE_FIXED_CENTS: int = 150  # R1.50
 
+    PUBLIC_BASE_URL: str = "http://localhost:8000"
+    CORS_ORIGINS: str = "http://localhost:3000"
+    WEBHOOK_MAX_ATTEMPTS: int = 5
+    WEBHOOK_TIMEOUT_SECONDS: float = 10.0
+    ENABLE_WEBHOOK_RETRY_LOOP: bool = True
+
     # Mock provider settings
     MOCK_PROVIDER_SUCCESS_RATE: float = 0.85
 
